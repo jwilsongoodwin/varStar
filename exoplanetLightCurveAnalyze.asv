@@ -1,0 +1,221 @@
+clear; clc; close all;
+
+%% === Load Light Curve ===
+[file, path] = uigetfile({'*.csv;*.tbl;*.txt', 'Light Curve Files'}, 'Select Light Curve File');
+if isequal(file, 0)
+    disp('User canceled.');
+    return;
+end
+filename = fullfile(path, file);
+disp(['Loading: ', filename]);
+
+[~, ~, ext] = fileparts(filename);
+switch lower(ext)
+    case {'.tbl', '.txt'}
+        fid = fopen(filename); for i = 1:3, fgetl(fid); end
+        data = textscan(fid, '%f %f %f'); fclose(fid);
+        time = data{2}; flux = data{3};
+    case '.csv'
+        tbl = readtable(filename);
+        time = tbl{:,1}; flux = tbl{:,2};
+    otherwise
+        error('Unsupported file format.');
+end
+
+%% === General Parameters ===
+T_total = max(time) - min(time);
+dt = median(diff(time));
+Fs = 1/dt;
+
+min_period = max(2*dt, 0.5);
+max_short = min(10, T_total/4);
+max_long = min(300, T_total/2);
+period_range = [min_period, max_short];
+long_period_range = [max_short, max_long];
+period_step = 0.0005;
+transit_width = 0.02;
+n_bins = 1000;
+highpass_cutoff_days = max(10, T_total/3);
+
+%% === Preprocess ===
+flux = flux - median(flux);
+flux_detrended = detrend(flux);
+fc = 1/highpass_cutoff_days;
+[b, a] = butter(2, fc/(Fs/2), 'high');
+flux_hp = filtfilt(b, a, flux_detrended);
+
+%% === FFT Detection with BLS Scoring & Refinement ===
+N = length(flux_hp);
+f = (0:N-1)*Fs/N;
+F = fft(flux_hp);
+power = abs(F).^2;
+periods = 1 ./ f;
+
+valid_idx = periods > long_period_range(1) & periods < long_period_range(2);
+valid_periods = periods(valid_idx);
+valid_power = power(valid_idx);
+
+[sorted_power_all, idx_sorted] = maxk(valid_power, 15);
+fft_candidate_periods_all = valid_periods(idx_sorted);
+
+% Harmonic filtering
+tol = 0.02;
+keep = true(size(fft_candidate_periods_all));
+for i = 1:length(fft_candidate_periods_all)
+    for j = i+1:length(fft_candidate_periods_all)
+        r = fft_candidate_periods_all(i) / fft_candidate_periods_all(j);
+        if abs(r - round(r)) < tol || abs(1/r - round(1/r)) < tol
+            keep(j) = false;
+        end
+    end
+end
+
+fft_candidate_periods = fft_candidate_periods_all(keep);
+sorted_power = sorted_power_all(keep);
+min_transits = 2;
+enough_transits = fft_candidate_periods <= (T_total / min_transits);
+fft_candidate_periods = fft_candidate_periods(enough_transits);
+sorted_power = sorted_power(enough_transits);
+
+[~, final_idx] = maxk(sorted_power, min(5, length(sorted_power)));
+fft_candidate_periods = fft_candidate_periods(final_idx);
+sorted_power = sorted_power(final_idx);
+
+% Store refined BLS scores
+refined_periods = [];
+refined_scores = [];
+
+figure;
+semilogx(valid_periods, valid_power, 'k-');
+xlabel('Period (days)'); ylabel('Power');
+title(sprintf('FFT Power Spectrum (%.1f–%.1f days)', long_period_range(1), long_period_range(2)));
+grid on;
+
+for i = 1:length(fft_candidate_periods)
+    P = fft_candidate_periods(i);
+    phase = mod(time, P)/P;
+    [phase_sorted, idx] = sort(phase);
+    flux_sorted = flux_hp(idx);
+    edges = linspace(0,1,n_bins+1);
+    bin_centers = edges(1:end-1) + diff(edges)/2;
+    [~,~,bin] = histcounts(phase_sorted, edges);
+    binned_flux = accumarray(bin(bin>0), flux_sorted(bin>0), [], @mean);
+    binned_flux = movmean(binned_flux, 3);
+
+    [score, ~, dip_phase] = bls_score(phase_sorted, flux_sorted, transit_width, n_bins);
+    fprintf('FFT period %.4f → BLS score = %.3f\n', P, score);
+
+    best_score = score;
+    best_P = P;
+    P_range = linspace(P*0.99, P*1.01, 20);
+    for trial_P = P_range
+        phase_trial = mod(time, trial_P)/trial_P;
+        [phase_sorted, idx] = sort(phase_trial);
+        flux_sorted = flux_hp(idx);
+        score_trial = bls_score(phase_sorted, flux_sorted, transit_width, n_bins);
+        if score_trial > best_score
+            best_score = score_trial;
+            best_P = trial_P;
+        end
+    end
+
+    refined_periods(end+1) = best_P;
+    refined_scores(end+1) = best_score;
+
+    % Final plot
+    phase = mod(time, best_P)/best_P;
+    [phase_sorted, idx] = sort(phase);
+    flux_sorted = flux_hp(idx);
+    [~, ~, dip_phase] = bls_score(phase_sorted, flux_sorted, transit_width, n_bins);
+    [~,~,bin] = histcounts(phase_sorted, edges);
+    binned_flux = accumarray(bin(bin>0), flux_sorted(bin>0), [], @mean);
+    binned_flux = movmean(binned_flux, 3);
+
+    figure;
+    plot(bin_centers, binned_flux, 'k-');
+    xline(dip_phase, 'r--', 'Transit?');
+    xlabel('Phase'); ylabel('Flux');
+    title(sprintf('Refined FFT Candidate: %.4f days | Score = %.3f', best_P, best_score));
+    grid on;
+end
+
+% Final FFT table
+fft_bls_table = table(refined_periods(:), refined_scores(:), ...
+    'VariableNames', {'Period_days', 'BLS_Score'});
+fft_bls_table = sortrows(fft_bls_table, 'BLS_Score', 'descend');
+disp('Final FFT Candidate Periods Ranked by Transit Score:');
+disp(fft_bls_table);
+
+%% === Short-Period Brute-Force BLS ===
+fprintf('\nBLS scan over %.2f to %.2f days...\n', period_range(1), period_range(2));
+frequencies = logspace(log10(1/period_range(2)), log10(1/period_range(1)), 5000);
+short_periods = 1 ./ frequencies;
+dip_scores = zeros(size(short_periods));
+h = waitbar(0, 'Scanning short periods...');
+for j = 1:length(short_periods)
+    P = short_periods(j);
+    phase = mod(time, P)/P;
+    [phase_sorted, idx] = sort(phase);
+    flux_sorted = flux_hp(idx);
+    adaptive_width = 0.05 * (P^0.33);
+    dip_scores(j) = bls_score(phase_sorted, flux_sorted, adaptive_width, n_bins);
+    waitbar(j / length(short_periods), h);
+end
+close(h);
+
+[sorted_scores, idx] = maxk(dip_scores, 3);
+top_short_periods = short_periods(idx);
+short_scores = sorted_scores;
+
+short_bls_table = table(top_short_periods(:), short_scores(:), ...
+    'VariableNames', {'Period_days', 'BLS_Score'});
+disp('Top Short-Period Transit Candidates:');
+disp(short_bls_table);
+
+%% === Long-Period Brute-Force BLS ===
+long_bls_range = [20, 320];
+long_step = 0.1;
+long_periods = long_bls_range(1):long_step:long_bls_range(2);
+long_scores = zeros(size(long_periods));
+h2 = waitbar(0, 'Scanning long periods...');
+for j = 1:length(long_periods)
+    P = long_periods(j);
+    phase = mod(time, P)/P;
+    [phase_sorted, idx] = sort(phase);
+    flux_sorted = flux_hp(idx);
+    adaptive_width = 0.05 * (P^0.33);
+    long_scores(j) = bls_score(phase_sorted, flux_sorted, adaptive_width, n_bins);
+    waitbar(j / length(long_periods), h2);
+end
+close(h2);
+
+[sorted_long_scores, idx_long] = maxk(long_scores, 3);
+top_long_periods = long_periods(idx_long);
+
+long_bls_table = table(top_long_periods(:), sorted_long_scores(:), ...
+    'VariableNames', {'Period_days', 'BLS_Score'});
+disp('Top Long-Period Transit Candidates:');
+disp(long_bls_table);
+
+%% === BLS Scoring Function ===
+function [best_score, best_depth, best_phase] = bls_score(phase, flux, transit_width, n_bins)
+    edges = linspace(0,1,n_bins+1);
+    bin_centers = edges(1:end-1) + diff(edges)/2;
+    [~,~,bin] = histcounts(phase, edges);
+    binned_flux = accumarray(bin(bin>0), flux(bin>0), [], @mean);
+    binned_flux = movmean(binned_flux, 3);
+    scores = zeros(size(bin_centers)); depths = zeros(size(bin_centers));
+    for i = 1:length(bin_centers)
+        center = bin_centers(i);
+        in = abs(bin_centers - center) < transit_width/2;
+        out = ~in;
+        if sum(in) < 5 || sum(out) < 10, continue; end
+        d = -mean(binned_flux(in));
+        sigma2 = var(binned_flux(out));
+        scores(i) = d^2 / sigma2;
+        depths(i) = d;
+    end
+    [best_score, idx] = max(scores);
+    best_depth = depths(idx);
+    best_phase = bin_centers(idx);
+end
